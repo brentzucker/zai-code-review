@@ -31841,7 +31841,7 @@ const https = __nccwpck_require__(5692);
 const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
 const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 300_000;
+const REQUEST_TIMEOUT_MS = 600_000;
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
