@@ -7,6 +7,8 @@ const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 600_000;
 const MAX_REVIEW_HISTORY_CHARS = 30_000;
+const MAX_COMPARE_FILES = 300;
+const REVIEW_BOT_LOGIN = 'github-actions[bot]';
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -44,25 +46,44 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
   return files;
 }
 
-async function getIncrementalChangedFiles(octokit, owner, repo, baseSha, headSha) {
-  const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
-    owner,
-    repo,
-    basehead: `${baseSha}...${headSha}`,
-    per_page: 100,
-  });
-  return data.files || [];
-}
-
-async function getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha) {
-  if (lastReviewedSha && lastReviewedSha !== headSha) {
-    return getIncrementalChangedFiles(octokit, owner, repo, lastReviewedSha, headSha);
+async function getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha, log = () => {}) {
+  if (!lastReviewedSha || lastReviewedSha === headSha) {
+    return getChangedFiles(octokit, owner, repo, pullNumber);
   }
-  return getChangedFiles(octokit, owner, repo, pullNumber);
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${lastReviewedSha}...${headSha}`,
+      per_page: 100,
+    });
+    if (data.status !== 'ahead' || data.merge_base_commit?.sha !== lastReviewedSha) {
+      log(`Commit range ${lastReviewedSha}...${headSha} is not a safe ancestor comparison; using the full PR diff.`);
+      return getChangedFiles(octokit, owner, repo, pullNumber);
+    }
+    // GitHub caps compare response file details at 300. Use the paginated PR
+    // file list when the cap is reached so later changed files are not missed.
+    if (!Array.isArray(data.files) || data.files.length >= MAX_COMPARE_FILES) {
+      log('Incremental compare reached GitHub’s 300-file limit; using the full PR diff.');
+      return getChangedFiles(octokit, owner, repo, pullNumber);
+    }
+    return data.files;
+  } catch (error) {
+    log(`Could not compare against the previous review SHA (${error.message}); using the full PR diff.`);
+    return getChangedFiles(octokit, owner, repo, pullNumber);
+  }
 }
 
 function isBotReviewComment(comment) {
-  return comment.user?.type === 'Bot' && comment.body?.includes(COMMENT_MARKER);
+  return comment.user?.login === REVIEW_BOT_LOGIN
+    && comment.user?.type === 'Bot'
+    && comment.body?.includes(COMMENT_MARKER);
+}
+
+function isAgentDisposition(comment, pullRequestAuthor) {
+  return Boolean(pullRequestAuthor)
+    && comment.user?.login === pullRequestAuthor
+    && comment.user?.type !== 'Bot';
 }
 
 function getLastReviewedSha(comments) {
@@ -104,7 +125,7 @@ function buildPrompt(files, maxDiffChars, reviewHistory = '', headSha = 'unknown
   return `Review the current pull request diff at head ${headSha}. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments. Base every finding and fix verification on evidence in the current diff, and include file/line references when available.${history}\n\nCurrent diff:\n${diffs}`;
 }
 
-async function getReviewComments(octokit, owner, repo, pullNumber) {
+async function getReviewComments(octokit, owner, repo, pullNumber, pullRequestAuthor) {
   const comments = [];
   let page = 1;
   while (true) {
@@ -119,16 +140,25 @@ async function getReviewComments(octokit, owner, repo, pullNumber) {
     if (data.length < 100) break;
     page++;
   }
-  return comments
+  const firstReviewAt = comments
     .filter(isBotReviewComment)
+    .map(comment => new Date(comment.created_at))
+    .sort((a, b) => a - b)[0];
+  return comments.filter(comment => isBotReviewComment(comment)
+      || (firstReviewAt && new Date(comment.created_at) >= firstReviewAt && isAgentDisposition(comment, pullRequestAuthor)))
+    .map(comment => ({ ...comment, isAgentDisposition: isAgentDisposition(comment, pullRequestAuthor) }))
     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
 function getReviewHistory(comments, maxChars = MAX_REVIEW_HISTORY_CHARS) {
   const rounds = comments
-    .filter(isBotReviewComment)
+    .filter(comment => isBotReviewComment(comment) || comment.isAgentDisposition)
     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-    .map(comment => comment.body.replace(/<!-- zai-code-review(?: head:[0-9a-f]{40})? -->/ig, '').trim())
+    .map(comment => {
+      const label = isBotReviewComment(comment) ? 'Z.ai review' : 'Implementing-agent disposition';
+      const body = comment.body.replace(/<!-- zai-code-review(?: head:[0-9a-f]{40})? -->/ig, '').trim();
+      return `### ${label}\n${body}`;
+    })
     .filter(Boolean);
   let selected = [];
   let size = 0;
@@ -154,6 +184,12 @@ function getReviewHistory(comments, maxChars = MAX_REVIEW_HISTORY_CHARS) {
     history = `${omittedNote}\n\n${history.slice(-available)}`;
   }
   return history.length > maxChars ? history.slice(-maxChars) : history;
+}
+
+function getIncompleteDiffNotice(files) {
+  const missing = files.filter(file => !file.patch).map(file => file.filename);
+  if (missing.length === 0) return '';
+  return `**Review incomplete:** GitHub did not provide patches for ${missing.length} changed file(s), so their contents could not be assessed: ${missing.join(', ')}.`;
 }
 
 async function getCurrentHeadSha(octokit, owner, repo, pullNumber) {
@@ -278,9 +314,10 @@ async function run() {
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
   const headSha = context.payload.pull_request.head.sha;
-  const priorComments = await getReviewComments(octokit, owner, repo, pullNumber);
+  const pullRequestAuthor = context.payload.pull_request.user?.login;
+  const priorComments = await getReviewComments(octokit, owner, repo, pullNumber, pullRequestAuthor);
   const lastReviewedSha = getLastReviewedSha(priorComments);
-  const files = await getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha);
+  const files = await getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha, message => core.info(message));
 
   const filteredFiles = filterFiles(files, excludePatterns);
 
@@ -291,19 +328,19 @@ async function run() {
     }
   }
 
-  if (!filteredFiles.some(f => f.patch)) {
-    core.info('No patchable changes found after filtering. Skipping review.');
-    return;
-  }
-
   const reviewHistory = getReviewHistory(priorComments);
-  const prompt = buildPrompt(filteredFiles, maxDiffChars, reviewHistory, headSha);
-
-  core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
-  const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
+  const incompleteNotice = getIncompleteDiffNotice(filteredFiles);
+  let review;
+  if (!filteredFiles.some(file => file.patch)) {
+    review = 'No code findings could be assessed because GitHub did not provide patch data for the changed files.';
+  } else {
+    const prompt = buildPrompt(filteredFiles, maxDiffChars, reviewHistory, headSha);
+    core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
+    review = await callZaiApi(apiKey, model, systemPrompt, prompt);
+  }
   // A run can finish after a newer synchronize event has started. Never post
   // feedback for a head that is no longer the PR's current revision.
-  const body = `## ${reviewerName} — review of ${headSha.slice(0, 12)}\n\n${review}\n\n${COMMENT_MARKER}\n<!-- zai-code-review head:${headSha} -->`;
+  const body = `## ${reviewerName} — review of ${headSha.slice(0, 12)}\n\n${incompleteNotice ? `${incompleteNotice}\n\n` : ''}${review}\n\n${COMMENT_MARKER}\n<!-- zai-code-review head:${headSha} -->`;
   // Post each round as a new comment so concurrent runs cannot overwrite
   // earlier review history. The SHA makes each round's evidence explicit.
   const posted = await postReviewIfCurrent(octokit, owner, repo, pullNumber, headSha, body, message => core.info(message));
@@ -313,10 +350,10 @@ async function run() {
 module.exports = {
   buildPrompt,
   getChangedFiles,
-  getIncrementalChangedFiles,
   getReviewDiff,
   getReviewComments,
   getReviewHistory,
+  getIncompleteDiffNotice,
   getLastReviewedSha,
   getCurrentHeadSha,
   postReviewIfCurrent,

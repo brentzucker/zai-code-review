@@ -7,7 +7,7 @@ AI-powered GitHub Pull Request code review using Z.ai models. Automatic PR comme
 - 🚀 Detect bugs
 - 🔍 Suggest improvements
 - 🧠 AI-driven PR feedback
-- 🧾 Keeps SHA-labeled review rounds and checks earlier findings on follow-up commits
+- 🧾 Keeps SHA-labeled review rounds, includes implementation dispositions, and checks only follow-up commits
 - ⚡ Works with GitHub Actions
 
 ## Quickstart
