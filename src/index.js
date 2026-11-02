@@ -6,6 +6,7 @@ const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
 const COMMENT_MARKER = '<!-- zai-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 600_000;
+const MAX_REVIEW_HISTORY_CHARS = 30_000;
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -43,6 +44,37 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
   return files;
 }
 
+async function getIncrementalChangedFiles(octokit, owner, repo, baseSha, headSha) {
+  const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+    owner,
+    repo,
+    basehead: `${baseSha}...${headSha}`,
+    per_page: 100,
+  });
+  return data.files || [];
+}
+
+async function getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha) {
+  if (lastReviewedSha && lastReviewedSha !== headSha) {
+    return getIncrementalChangedFiles(octokit, owner, repo, lastReviewedSha, headSha);
+  }
+  return getChangedFiles(octokit, owner, repo, pullNumber);
+}
+
+function isBotReviewComment(comment) {
+  return comment.user?.type === 'Bot' && comment.body?.includes(COMMENT_MARKER);
+}
+
+function getLastReviewedSha(comments) {
+  const latest = comments
+    .filter(isBotReviewComment)
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  if (!latest) return null;
+  return latest.body.match(/<!-- zai-code-review head:([0-9a-f]{40}) -->/i)?.[1]
+    || latest.body.match(/review of ([0-9a-f]{7,40})/i)?.[1]
+    || null;
+}
+
 function buildPrompt(files, maxDiffChars, reviewHistory = '', headSha = 'unknown') {
   const patchableFiles = files.filter(f => f.patch);
   const includedDiffs = [];
@@ -66,7 +98,7 @@ function buildPrompt(files, maxDiffChars, reviewHistory = '', headSha = 'unknown
   }
 
   const history = reviewHistory
-    ? `\n\nPrevious review rounds (context only; verify every claim against the current diff):\n${reviewHistory}\n\nFor each prior finding, state whether the current diff resolves it, leaves it unresolved, or does not provide enough evidence to decide. Cite the current changed code as evidence. Do not claim a finding is fixed merely because the code changed. Then report any new findings. Keep prior findings in their original context; this round is a follow-up, not a replacement for review history.`
+    ? `\n\nPrevious review rounds (context only; verify every claim against the current diff):\n${reviewHistory}\n\nFor EACH prior finding, give one explicit disposition: FIXED, UNRESOLVED, or UNVERIFIABLE. Cite current changed code as evidence for FIXED or UNRESOLVED; use UNVERIFIABLE when the incremental diff does not establish the finding's status. Do not claim a finding is fixed merely because related code changed. Then report any new findings. Keep prior findings in their original context; this round supplements the history rather than replacing it.`
     : '';
 
   return `Review the current pull request diff at head ${headSha}. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments. Base every finding and fix verification on evidence in the current diff, and include file/line references when available.${history}\n\nCurrent diff:\n${diffs}`;
@@ -88,22 +120,69 @@ async function getReviewComments(octokit, owner, repo, pullNumber) {
     page++;
   }
   return comments
-    .filter(comment => comment.body?.includes(COMMENT_MARKER))
+    .filter(isBotReviewComment)
     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
-function getReviewHistory(comments) {
-  return comments
-    .filter(comment => comment.body?.includes(COMMENT_MARKER))
+function getReviewHistory(comments, maxChars = MAX_REVIEW_HISTORY_CHARS) {
+  const rounds = comments
+    .filter(isBotReviewComment)
     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-    .map(comment => comment.body
-    .replace(COMMENT_MARKER, '')
-    .trim()).filter(Boolean).join('\n\n---\n\n');
+    .map(comment => comment.body.replace(/<!-- zai-code-review(?: head:[0-9a-f]{40})? -->/ig, '').trim())
+    .filter(Boolean);
+  let selected = [];
+  let size = 0;
+  for (let i = rounds.length - 1; i >= 0; i--) {
+    const round = rounds[i];
+    const addition = round.length + (selected.length ? 9 : 0);
+    if (size + addition <= maxChars) {
+      selected.unshift(round);
+      size += addition;
+    } else if (selected.length === 0 && maxChars > 0) {
+      selected.unshift(round.slice(-maxChars));
+      size = maxChars;
+      break;
+    } else {
+      break;
+    }
+  }
+  const omitted = selected.length < rounds.length;
+  const omittedNote = '[Earlier rounds remain in the PR comments but are omitted here because review history exceeded the prompt limit.]';
+  let history = selected.join('\n\n---\n\n');
+  if (omitted && maxChars > omittedNote.length + 2) {
+    const available = maxChars - omittedNote.length - 2;
+    history = `${omittedNote}\n\n${history.slice(-available)}`;
+  }
+  return history.length > maxChars ? history.slice(-maxChars) : history;
 }
 
 async function getCurrentHeadSha(octokit, owner, repo, pullNumber) {
   const { data } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber });
   return data.head.sha;
+}
+
+async function postReviewIfCurrent(octokit, owner, repo, pullNumber, headSha, body, log = () => {}) {
+  const currentHeadSha = await getCurrentHeadSha(octokit, owner, repo, pullNumber);
+  if (currentHeadSha !== headSha) {
+    log(`Discarding stale review for ${headSha}; current head is ${currentHeadSha}.`);
+    return false;
+  }
+
+  const { data: comment } = await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: pullNumber,
+    body,
+  });
+  // Recheck after the write to close the race where a synchronize event lands
+  // between the preflight check and comment creation.
+  const finalHeadSha = await getCurrentHeadSha(octokit, owner, repo, pullNumber);
+  if (finalHeadSha !== headSha) {
+    await octokit.rest.issues.deleteComment({ owner, repo, comment_id: comment.id });
+    log(`Removed stale review for ${headSha}; current head is ${finalHeadSha}.`);
+    return false;
+  }
+  return true;
 }
 
 function callZaiApi(apiKey, model, systemPrompt, prompt) {
@@ -198,7 +277,10 @@ async function run() {
   const octokit = github.getOctokit(token);
 
   core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const files = await getChangedFiles(octokit, owner, repo, pullNumber);
+  const headSha = context.payload.pull_request.head.sha;
+  const priorComments = await getReviewComments(octokit, owner, repo, pullNumber);
+  const lastReviewedSha = getLastReviewedSha(priorComments);
+  const files = await getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha);
 
   const filteredFiles = filterFiles(files, excludePatterns);
 
@@ -214,8 +296,6 @@ async function run() {
     return;
   }
 
-  const headSha = context.payload.pull_request.head.sha;
-  const priorComments = await getReviewComments(octokit, owner, repo, pullNumber);
   const reviewHistory = getReviewHistory(priorComments);
   const prompt = buildPrompt(filteredFiles, maxDiffChars, reviewHistory, headSha);
 
@@ -223,25 +303,24 @@ async function run() {
   const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
   // A run can finish after a newer synchronize event has started. Never post
   // feedback for a head that is no longer the PR's current revision.
-  const currentHeadSha = await getCurrentHeadSha(octokit, owner, repo, pullNumber);
-  if (currentHeadSha !== headSha) {
-    core.info(`Discarding stale review for ${headSha}; current head is ${currentHeadSha}.`);
-    return;
-  }
-
-  const body = `## ${reviewerName} — review of ${headSha.slice(0, 12)}\n\n${review}\n\n${COMMENT_MARKER}`;
+  const body = `## ${reviewerName} — review of ${headSha.slice(0, 12)}\n\n${review}\n\n${COMMENT_MARKER}\n<!-- zai-code-review head:${headSha} -->`;
   // Post each round as a new comment so concurrent runs cannot overwrite
   // earlier review history. The SHA makes each round's evidence explicit.
-  await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: pullNumber,
-    body,
-  });
-  core.info('Review comment posted.');
+  const posted = await postReviewIfCurrent(octokit, owner, repo, pullNumber, headSha, body, message => core.info(message));
+  if (posted) core.info('Review comment posted.');
 }
 
-module.exports = { buildPrompt, getReviewComments, getReviewHistory, getCurrentHeadSha };
+module.exports = {
+  buildPrompt,
+  getChangedFiles,
+  getIncrementalChangedFiles,
+  getReviewDiff,
+  getReviewComments,
+  getReviewHistory,
+  getLastReviewedSha,
+  getCurrentHeadSha,
+  postReviewIfCurrent,
+};
 
 if (require.main === module) {
   run().catch(err => core.setFailed(err.message));
