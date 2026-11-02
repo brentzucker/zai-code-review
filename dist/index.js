@@ -29922,6 +29922,378 @@ function wrappy (fn, cb) {
 
 /***/ }),
 
+/***/ 5105:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+/* module decorator */ module = __nccwpck_require__.nmd(module);
+const core = __nccwpck_require__(7484);
+const github = __nccwpck_require__(3228);
+const https = __nccwpck_require__(5692);
+
+const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
+const COMMENT_MARKER = '<!-- zai-code-review -->';
+const MAX_RESPONSE_SIZE = 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 600_000;
+const MAX_REVIEW_HISTORY_CHARS = 30_000;
+const MAX_COMPARE_FILES = 300;
+const REVIEW_BOT_LOGIN = 'github-actions[bot]';
+
+function matchesPattern(filename, pattern) {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '\x00')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\x00/g, '.*');
+  const regex = new RegExp(`^${escaped}$`);
+  const basename = filename.split('/').pop();
+  return regex.test(filename) || regex.test(basename);
+}
+
+function filterFiles(files, excludePatterns) {
+  if (!excludePatterns || excludePatterns.length === 0) {
+    return files;
+  }
+  return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
+}
+
+async function getChangedFiles(octokit, owner, repo, pullNumber) {
+  const files = [];
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.pulls.listFiles({
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+      page,
+    });
+    files.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  return files;
+}
+
+async function getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha, log = () => {}) {
+  if (!lastReviewedSha || lastReviewedSha === headSha) {
+    return getChangedFiles(octokit, owner, repo, pullNumber);
+  }
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${lastReviewedSha}...${headSha}`,
+      per_page: 100,
+    });
+    if (data.status !== 'ahead' || data.merge_base_commit?.sha !== lastReviewedSha) {
+      log(`Commit range ${lastReviewedSha}...${headSha} is not a safe ancestor comparison; using the full PR diff.`);
+      return getChangedFiles(octokit, owner, repo, pullNumber);
+    }
+    // GitHub caps compare response file details at 300. Use the paginated PR
+    // file list when the cap is reached so later changed files are not missed.
+    if (!Array.isArray(data.files) || data.files.length >= MAX_COMPARE_FILES) {
+      log('Incremental compare reached GitHub’s 300-file limit; using the full PR diff.');
+      return getChangedFiles(octokit, owner, repo, pullNumber);
+    }
+    return data.files;
+  } catch (error) {
+    log(`Could not compare against the previous review SHA (${error.message}); using the full PR diff.`);
+    return getChangedFiles(octokit, owner, repo, pullNumber);
+  }
+}
+
+function isBotReviewComment(comment) {
+  return comment.user?.login === REVIEW_BOT_LOGIN
+    && comment.user?.type === 'Bot'
+    && comment.body?.includes(COMMENT_MARKER);
+}
+
+function isAgentDisposition(comment, pullRequestAuthor) {
+  return Boolean(pullRequestAuthor)
+    && comment.user?.login === pullRequestAuthor
+    && comment.user?.type !== 'Bot';
+}
+
+function getLastReviewedSha(comments) {
+  const latest = comments
+    .filter(isBotReviewComment)
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  if (!latest) return null;
+  return latest.body.match(/<!-- zai-code-review head:([0-9a-f]{40}) -->/i)?.[1]
+    || latest.body.match(/review of ([0-9a-f]{7,40})/i)?.[1]
+    || null;
+}
+
+function buildPrompt(files, maxDiffChars, reviewHistory = '', headSha = 'unknown') {
+  const patchableFiles = files.filter(f => f.patch);
+  const includedDiffs = [];
+  const skippedFiles = [];
+  let totalChars = 0;
+
+  for (const f of patchableFiles) {
+    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.patch}\n\`\`\``;
+    if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
+      skippedFiles.push(f.filename);
+    } else {
+      includedDiffs.push(entry);
+      totalChars += entry.length;
+    }
+  }
+
+  let diffs = includedDiffs.join('\n\n');
+
+  if (skippedFiles.length > 0) {
+    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
+  }
+
+  const history = reviewHistory
+    ? `\n\nPrevious review rounds (context only; verify every claim against the current diff):\n${reviewHistory}\n\nFor EACH prior finding, give one explicit disposition: FIXED, UNRESOLVED, or UNVERIFIABLE. Cite current changed code as evidence for FIXED or UNRESOLVED; use UNVERIFIABLE when the incremental diff does not establish the finding's status. Do not claim a finding is fixed merely because related code changed. Then report any new findings. Keep prior findings in their original context; this round supplements the history rather than replacing it.`
+    : '';
+
+  return `Review the current pull request diff at head ${headSha}. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments. Base every finding and fix verification on evidence in the current diff, and include file/line references when available.${history}\n\nCurrent diff:\n${diffs}`;
+}
+
+async function getReviewComments(octokit, owner, repo, pullNumber, pullRequestAuthor) {
+  const comments = [];
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.issues.listComments({
+      owner,
+      repo,
+      issue_number: pullNumber,
+      per_page: 100,
+      page,
+    });
+    comments.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  const firstReviewAt = comments
+    .filter(isBotReviewComment)
+    .map(comment => new Date(comment.created_at))
+    .sort((a, b) => a - b)[0];
+  return comments.filter(comment => isBotReviewComment(comment)
+      || (firstReviewAt && new Date(comment.created_at) >= firstReviewAt && isAgentDisposition(comment, pullRequestAuthor)))
+    .map(comment => ({ ...comment, isAgentDisposition: isAgentDisposition(comment, pullRequestAuthor) }))
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+}
+
+function getReviewHistory(comments, maxChars = MAX_REVIEW_HISTORY_CHARS) {
+  const rounds = comments
+    .filter(comment => isBotReviewComment(comment) || comment.isAgentDisposition)
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    .map(comment => {
+      const label = isBotReviewComment(comment) ? 'Z.ai review' : 'Implementing-agent disposition';
+      const body = comment.body.replace(/<!-- zai-code-review(?: head:[0-9a-f]{40})? -->/ig, '').trim();
+      return `### ${label}\n${body}`;
+    })
+    .filter(Boolean);
+  let selected = [];
+  let size = 0;
+  for (let i = rounds.length - 1; i >= 0; i--) {
+    const round = rounds[i];
+    const addition = round.length + (selected.length ? 9 : 0);
+    if (size + addition <= maxChars) {
+      selected.unshift(round);
+      size += addition;
+    } else if (selected.length === 0 && maxChars > 0) {
+      selected.unshift(round.slice(-maxChars));
+      size = maxChars;
+      break;
+    } else {
+      break;
+    }
+  }
+  const omitted = selected.length < rounds.length;
+  const omittedNote = '[Earlier rounds remain in the PR comments but are omitted here because review history exceeded the prompt limit.]';
+  let history = selected.join('\n\n---\n\n');
+  if (omitted && maxChars > omittedNote.length + 2) {
+    const available = maxChars - omittedNote.length - 2;
+    history = `${omittedNote}\n\n${history.slice(-available)}`;
+  }
+  return history.length > maxChars ? history.slice(-maxChars) : history;
+}
+
+function getIncompleteDiffNotice(files) {
+  const missing = files.filter(file => !file.patch).map(file => file.filename);
+  if (missing.length === 0) return '';
+  return `**Review incomplete:** GitHub did not provide patches for ${missing.length} changed file(s), so their contents could not be assessed: ${missing.join(', ')}.`;
+}
+
+async function getCurrentHeadSha(octokit, owner, repo, pullNumber) {
+  const { data } = await octokit.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+  return data.head.sha;
+}
+
+async function postReviewIfCurrent(octokit, owner, repo, pullNumber, headSha, body, log = () => {}) {
+  const currentHeadSha = await getCurrentHeadSha(octokit, owner, repo, pullNumber);
+  if (currentHeadSha !== headSha) {
+    log(`Discarding stale review for ${headSha}; current head is ${currentHeadSha}.`);
+    return false;
+  }
+
+  const { data: comment } = await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: pullNumber,
+    body,
+  });
+  // Recheck after the write to close the race where a synchronize event lands
+  // between the preflight check and comment creation.
+  const finalHeadSha = await getCurrentHeadSha(octokit, owner, repo, pullNumber);
+  if (finalHeadSha !== headSha) {
+    await octokit.rest.issues.deleteComment({ owner, repo, comment_id: comment.id });
+    log(`Removed stale review for ${headSha}; current head is ${finalHeadSha}.`);
+    return false;
+  }
+  return true;
+}
+
+function callZaiApi(apiKey, model, systemPrompt, prompt) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'system',
+          content: systemPrompt,
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    });
+
+    const url = new URL(ZAI_API_URL);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => {
+        data += chunk;
+        if (data.length > MAX_RESPONSE_SIZE) {
+          req.destroy(new Error('Z.ai API response exceeded size limit.'));
+        }
+      });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          let parsed;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            reject(new Error('Z.ai API returned invalid JSON.'));
+            return;
+          }
+          const content = parsed.choices?.[0]?.message?.content;
+          if (!content) {
+            reject(new Error('Z.ai API returned an empty response.'));
+          } else {
+            resolve(content);
+          }
+        } else {
+          reject(new Error(`Z.ai API error ${res.statusCode}: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error('Z.ai API request timed out.'));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function run() {
+  const apiKey = core.getInput('ZAI_API_KEY', { required: true });
+  core.setSecret(apiKey);
+  const model = core.getInput('ZAI_MODEL');
+  const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
+  const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
+  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
+    .split(',')
+    .map(p => p.trim())
+    .filter(p => p.length > 0);
+  const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
+  const token = core.getInput('GITHUB_TOKEN');
+  core.setSecret(token);
+
+  const { context } = github;
+  const { owner, repo } = context.repo;
+  const pullNumber = context.payload.pull_request?.number;
+
+  if (!pullNumber) {
+    core.setFailed('This action only runs on pull_request events.');
+    return;
+  }
+
+  const octokit = github.getOctokit(token);
+
+  core.info(`Fetching changed files for PR #${pullNumber}...`);
+  const headSha = context.payload.pull_request.head.sha;
+  const pullRequestAuthor = context.payload.pull_request.user?.login;
+  const priorComments = await getReviewComments(octokit, owner, repo, pullNumber, pullRequestAuthor);
+  const lastReviewedSha = getLastReviewedSha(priorComments);
+  const files = await getReviewDiff(octokit, owner, repo, pullNumber, lastReviewedSha, headSha, message => core.info(message));
+
+  const filteredFiles = filterFiles(files, excludePatterns);
+
+  if (excludePatterns.length > 0) {
+    const excluded = files.length - filteredFiles.length;
+    if (excluded > 0) {
+      core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
+    }
+  }
+
+  const reviewHistory = getReviewHistory(priorComments);
+  const incompleteNotice = getIncompleteDiffNotice(filteredFiles);
+  let review;
+  if (!filteredFiles.some(file => file.patch)) {
+    review = 'No code findings could be assessed because GitHub did not provide patch data for the changed files.';
+  } else {
+    const prompt = buildPrompt(filteredFiles, maxDiffChars, reviewHistory, headSha);
+    core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
+    review = await callZaiApi(apiKey, model, systemPrompt, prompt);
+  }
+  // A run can finish after a newer synchronize event has started. Never post
+  // feedback for a head that is no longer the PR's current revision.
+  const body = `## ${reviewerName} — review of ${headSha.slice(0, 12)}\n\n${incompleteNotice ? `${incompleteNotice}\n\n` : ''}${review}\n\n${COMMENT_MARKER}\n<!-- zai-code-review head:${headSha} -->`;
+  // Post each round as a new comment so concurrent runs cannot overwrite
+  // earlier review history. The SHA makes each round's evidence explicit.
+  const posted = await postReviewIfCurrent(octokit, owner, repo, pullNumber, headSha, body, message => core.info(message));
+  if (posted) core.info('Review comment posted.');
+}
+
+module.exports = {
+  buildPrompt,
+  getChangedFiles,
+  getReviewDiff,
+  getReviewComments,
+  getReviewHistory,
+  getIncompleteDiffNotice,
+  getLastReviewedSha,
+  getCurrentHeadSha,
+  postReviewIfCurrent,
+};
+
+if (__nccwpck_require__.c[__nccwpck_require__.s] === module) {
+  run().catch(err => core.setFailed(err.message));
+}
+
+
+/***/ }),
+
 /***/ 2613:
 /***/ ((module) => {
 
@@ -31809,8 +32181,8 @@ module.exports = parseParams
 /******/ 		}
 /******/ 		// Create a new module (and put it into the cache)
 /******/ 		var module = __webpack_module_cache__[moduleId] = {
-/******/ 			// no module.id needed
-/******/ 			// no module.loaded needed
+/******/ 			id: moduleId,
+/******/ 			loaded: false,
 /******/ 			exports: {}
 /******/ 		};
 /******/ 	
@@ -31823,229 +32195,37 @@ module.exports = parseParams
 /******/ 			if(threw) delete __webpack_module_cache__[moduleId];
 /******/ 		}
 /******/ 	
+/******/ 		// Flag the module as loaded
+/******/ 		module.loaded = true;
+/******/ 	
 /******/ 		// Return the exports of the module
 /******/ 		return module.exports;
 /******/ 	}
 /******/ 	
+/******/ 	// expose the module cache
+/******/ 	__nccwpck_require__.c = __webpack_module_cache__;
+/******/ 	
 /************************************************************************/
+/******/ 	/* webpack/runtime/node module decorator */
+/******/ 	(() => {
+/******/ 		__nccwpck_require__.nmd = (module) => {
+/******/ 			module.paths = [];
+/******/ 			if (!module.children) module.children = [];
+/******/ 			return module;
+/******/ 		};
+/******/ 	})();
+/******/ 	
 /******/ 	/* webpack/runtime/compat */
 /******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
 /******/ 	
 /************************************************************************/
-var __webpack_exports__ = {};
-const core = __nccwpck_require__(7484);
-const github = __nccwpck_require__(3228);
-const https = __nccwpck_require__(5692);
-
-const ZAI_API_URL = 'https://api.z.ai/api/coding/paas/v4/chat/completions';
-const COMMENT_MARKER = '<!-- zai-code-review -->';
-const MAX_RESPONSE_SIZE = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 600_000;
-
-function matchesPattern(filename, pattern) {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '\x00')
-    .replace(/\*/g, '[^/]*')
-    .replace(/\x00/g, '.*');
-  const regex = new RegExp(`^${escaped}$`);
-  const basename = filename.split('/').pop();
-  return regex.test(filename) || regex.test(basename);
-}
-
-function filterFiles(files, excludePatterns) {
-  if (!excludePatterns || excludePatterns.length === 0) {
-    return files;
-  }
-  return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
-}
-
-async function getChangedFiles(octokit, owner, repo, pullNumber) {
-  const files = [];
-  let page = 1;
-  while (true) {
-    const { data } = await octokit.rest.pulls.listFiles({
-      owner,
-      repo,
-      pull_number: pullNumber,
-      per_page: 100,
-      page,
-    });
-    files.push(...data);
-    if (data.length < 100) break;
-    page++;
-  }
-  return files;
-}
-
-function buildPrompt(files, maxDiffChars) {
-  const patchableFiles = files.filter(f => f.patch);
-  const includedDiffs = [];
-  const skippedFiles = [];
-  let totalChars = 0;
-
-  for (const f of patchableFiles) {
-    const entry = `### ${f.filename} (${f.status})\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (maxDiffChars > 0 && totalChars + entry.length > maxDiffChars) {
-      skippedFiles.push(f.filename);
-    } else {
-      includedDiffs.push(entry);
-      totalChars += entry.length;
-    }
-  }
-
-  let diffs = includedDiffs.join('\n\n');
-
-  if (skippedFiles.length > 0) {
-    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
-  }
-
-  return `Please review the following pull request changes and provide concise, constructive feedback. Focus on bugs, logic errors, security issues, and meaningful improvements. Skip trivial style comments.\n\n${diffs}`;
-}
-
-function callZaiApi(apiKey, model, systemPrompt, prompt) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'system',
-          content: systemPrompt,
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    });
-
-    const url = new URL(ZAI_API_URL);
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, res => {
-      let data = '';
-      res.on('data', chunk => {
-        data += chunk;
-        if (data.length > MAX_RESPONSE_SIZE) {
-          req.destroy(new Error('Z.ai API response exceeded size limit.'));
-        }
-      });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          let parsed;
-          try {
-            parsed = JSON.parse(data);
-          } catch {
-            reject(new Error('Z.ai API returned invalid JSON.'));
-            return;
-          }
-          const content = parsed.choices?.[0]?.message?.content;
-          if (!content) {
-            reject(new Error('Z.ai API returned an empty response.'));
-          } else {
-            resolve(content);
-          }
-        } else {
-          reject(new Error(`Z.ai API error ${res.statusCode}: ${data.slice(0, 200)}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error('Z.ai API request timed out.'));
-    });
-    req.write(body);
-    req.end();
-  });
-}
-
-async function run() {
-  const apiKey = core.getInput('ZAI_API_KEY', { required: true });
-  core.setSecret(apiKey);
-  const model = core.getInput('ZAI_MODEL');
-  const systemPrompt = core.getInput('ZAI_SYSTEM_PROMPT');
-  const reviewerName = core.getInput('ZAI_REVIEWER_NAME');
-  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
-    .split(',')
-    .map(p => p.trim())
-    .filter(p => p.length > 0);
-  const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
-  const token = core.getInput('GITHUB_TOKEN');
-  core.setSecret(token);
-
-  const { context } = github;
-  const { owner, repo } = context.repo;
-  const pullNumber = context.payload.pull_request?.number;
-
-  if (!pullNumber) {
-    core.setFailed('This action only runs on pull_request events.');
-    return;
-  }
-
-  const octokit = github.getOctokit(token);
-
-  core.info(`Fetching changed files for PR #${pullNumber}...`);
-  const files = await getChangedFiles(octokit, owner, repo, pullNumber);
-
-  const filteredFiles = filterFiles(files, excludePatterns);
-
-  if (excludePatterns.length > 0) {
-    const excluded = files.length - filteredFiles.length;
-    if (excluded > 0) {
-      core.info(`Excluded ${excluded} file(s) matching EXCLUDE_PATTERNS.`);
-    }
-  }
-
-  if (!filteredFiles.some(f => f.patch)) {
-    core.info('No patchable changes found after filtering. Skipping review.');
-    return;
-  }
-
-  const prompt = buildPrompt(filteredFiles, maxDiffChars);
-
-  core.info(`Sending ${filteredFiles.length} file(s) to Z.ai for review...`);
-  const review = await callZaiApi(apiKey, model, systemPrompt, prompt);
-  const body = `## ${reviewerName}\n\n${review}\n\n${COMMENT_MARKER}`;
-
-  const { data: comments } = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number: pullNumber,
-  });
-  const existing = comments.find(c => c.body.includes(COMMENT_MARKER));
-
-  if (existing) {
-    await octokit.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: existing.id,
-      body,
-    });
-    core.info('Review comment updated.');
-  } else {
-    await octokit.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number: pullNumber,
-      body,
-    });
-    core.info('Review comment posted.');
-  }
-}
-
-run().catch(err => core.setFailed(err.message));
-
-module.exports = __webpack_exports__;
+/******/ 	
+/******/ 	// module cache are used so entry inlining is disabled
+/******/ 	// startup
+/******/ 	// Load entry module and return exports
+/******/ 	var __webpack_exports__ = __nccwpck_require__(__nccwpck_require__.s = 5105);
+/******/ 	module.exports = __webpack_exports__;
+/******/ 	
 /******/ })()
 ;
